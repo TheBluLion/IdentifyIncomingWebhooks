@@ -1,8 +1,13 @@
-﻿#requires -modules MicrosoftTeams
+#Requires -Modules @{ ModuleName = 'MicrosoftTeams'; GUID = 'd910df43-3ca6-4c9c-a2e3-e9f45a8e2ad9'; ModuleVersion = '1.1.6' }
 
 import-module MicrosoftTeams
 $username = Connect-MicrosoftTeams 
-$path = "c:\users\euloh\incomingwebhookreport.csv"
+#$path = "c:\users\euloh\incomingwebhookreport.csv"
+
+#init variables
+[System.Collections.ArrayList]$array
+[System.Collections.ArrayList]$getownerbatcharray=@()
+$getownerbatchindex=1
 
 #this hash table syncs the access token between multiple threads
 $hash = [hashtable]::Synchronized(@{})
@@ -34,6 +39,8 @@ $powershell.AddScript({
 
 $handle = $powershell.BeginInvoke()
 
+$path = read-host "Enter Path to report location ending in .csv"
+
 function Get-GraphResult($url,$token){
     try {
       $Headers = @{Authorization = "Bearer $($token)"}
@@ -64,20 +71,22 @@ function Get-GraphPost($url,$token, $body){
     }
 }
 
-#check for temp file to see this is a resumed attempte
+#check for temp file to see this is a resumed attempt
 
-try{
-    $url=get-content "$env:TEMP\webhook.tmp"
-}
-catch{
-    $url="failed to read temp file"
-}
+
+$url=get-content "$env:TEMP\webhook.tmp" -ea 0 
+
 
 #this if clause looks to see if the saved url is a valid skiptoken request, if not, just start over
-if ($url -notlike "*skiptoken"){
-    $url = "https://graph.microsoft.com/beta/groups?`$top=15&`$filter=resourceProvisioningOptions/any(c:c eq 'Team')&`$select=id,displayName"
+if (($url -eq $null) -or ($url -notlike "*skiptoken*")){
+    $url = "https://graph.microsoft.com/beta/groups?`$top=15&`$filter=resourceProvisioningOptions/any(c:c eq 'Team')&`$select=id"
 }
 
+#wait for runspace to generate valid token
+
+while($hash.token -eq "init"){
+    Start-Sleep -Milliseconds 200
+}
 
 while($url -notlike ""){
     #write url to temp file for persistence
@@ -88,7 +97,6 @@ while($url -notlike ""){
     #create batch request
     if ($result -notlike "Error:*"){
         $i=1
-        [System.Collections.ArrayList]$array
         $array=foreach($line in $result.value){
             @{"id"=$i;"method"="GET";"url"="/teams/$($line.id)/installedApps?`$expand=teamsAppDefinition&`$filter=teamsAppDefinition/id eq 'MjAzYTFlMmMtMjZjYy00N2NhLTgzYWUtYmU5OGY5NjBiNmIyIyMxLjA='"}
             $i++
@@ -110,23 +118,46 @@ while($url -notlike ""){
 
         #get owners
 
-        #write to csv
-        $result.value[$appIdIndex.id-1] |Select id,displayName,@{n='hasIncomingWebhook';e={"Yes"}}  |export-csv $path -Append -NoTypeInformation
-    }
+        $groupid = $result.value[$appIdIndex.id-1].id        
+        #add request to batch request
+        $getownerbatcharray.add(@{"id"=$getownerbatchindex;"method"="GET";"url"="/groups/$($groupid)?`$expand=owners&`$select=id,displayName,owners"})
+        $getownerbatchindex++
+
+            if($getownerbatchindex -gt 15){
+                $body=@{"requests"=$getownerbatcharray}|ConvertTo-Json
+                $ownerresults=Get-GraphPost -url "https://graph.microsoft.com/v1.0/`$batch" -token $hash.token -body $body
+                $getownerbatchindex=1    
+                $getownerbatcharray=@()
+                #write to csv
+                $ownerresults.responses.body|Select id,displayName,@{n='hasIncomingWebhook';e={"Yes"}},@{n='owners';e={($_.owners).mail -join ";"}}  |export-csv $path -Append -NoTypeInformation
+            }
+                  
+        }
 
 
     #update nextlink
     $url=$result.'@odata.nextLink'
-    #save
 }
+
+#do one last export of getownerbatcharray as this is may be less than 15
+
+if($getownerbatcharray.count -gt 0){
+    $body=@{"requests"=$getownerbatcharray}|ConvertTo-Json
+    $ownerresults=Get-GraphPost -url "https://graph.microsoft.com/v1.0/`$batch" -token $hash.token -body $body
+    #write to csv
+    $ownerresults.responses.body|Select id,displayName,@{n='hasIncomingWebhook';e={"Yes"}},@{n='owners';e={($_.owners).mail -join ";"}}  |export-csv $path -Append -NoTypeInformation
+}
+
+
 
 #cleanupstuff
 
-Write-Host "Report completed. File saved to $path"
-try{remove-file "$env:TEMP\webhook.tmp"}
+Write-Host "Report completed. File saved to $($path)"
+try{del "$env:TEMP\webhook.tmp" }
 catch{Write-Warning "Unable to clean up temp information for safe resume on crash"}
+write-host "Please close this powershell window to terminate the token refresh process"
 
 #clean up runspace that refreshes token
-$powershell.EndInvoke($handle)
-$runspace.Close()
-$powershell.Dispose()
+#$powershell.EndInvoke($handle)
+#$runspace.Close()
+#$powershell.Dispose()
